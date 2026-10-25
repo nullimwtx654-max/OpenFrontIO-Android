@@ -1,0 +1,1286 @@
+import {
+  PlayerStatsTree,
+  PrestigeResponse,
+  PublicProgress,
+  UserMeResponse,
+} from "@openfront/shared/ApiSchemas";
+import { assetUrl } from "@openfront/shared/AssetUrls";
+import { html, nothing, PropertyValues, TemplateResult } from "lit";
+import { customElement, state } from "lit/decorators.js";
+import { ClientEnv } from "src/client/ClientEnv";
+import {
+  hasLinkedIdentity,
+  responseHasLinkedIdentity,
+} from "./AccountIdentity";
+import { fetchPlayerById, getUserMe, invalidateUserMe } from "./Api";
+import {
+  discordLogin,
+  googleLogin,
+  linkGoogle,
+  linkSteam,
+  logOut,
+  reauthAfterPortalChange,
+  sendMagicLink,
+  steamLogin,
+} from "./Auth";
+import "./components/baseComponents/stats/DiscordUserHeader";
+import "./components/baseComponents/stats/PlayerGameHistoryView";
+import type { PlayerGameHistoryCache } from "./components/baseComponents/stats/PlayerGameHistoryView";
+import "./components/baseComponents/stats/PlayerStatsTable";
+import "./components/baseComponents/stats/PlayerStatsTree";
+import "./components/baseComponents/stats/SteamUserHeader";
+import { BaseModal } from "./components/BaseModal";
+import "./components/CopyButton";
+import "./components/CreatorCodePanel";
+import type { CreatorChangedDetail } from "./components/CreatorCodePanel";
+import "./components/CurrencyDisplay";
+import "./components/Difficulties";
+import "./components/FriendsList";
+import type { PrestigeFlow } from "./components/PrestigeFlow";
+import "./components/ProfileCard";
+import "./components/ProfileProgression";
+import "./components/RewardsPanel";
+import type { RewardsChangedDetail } from "./components/RewardsPanel";
+import { googleLinkButton } from "./components/ui/GoogleLinkButton";
+import { modalHeader } from "./components/ui/ModalHeader";
+import { steamGlyph, steamLinkButton } from "./components/ui/SteamLinkButton";
+import { desktopLinkGate, isDesktopShell } from "./DesktopShell";
+import { gamePortal, type PortalUser } from "./GamePortal";
+import "./GameStatsModal";
+import { showInGameAlert } from "./InGameModal";
+import { consumeLinkResult } from "./LinkResult";
+import { consumeLoginResult, LoginResult } from "./LoginResult";
+import "./PlayerProfileModal";
+import { loadPlayerProgress } from "./PlayerProgress";
+import {
+  PROVISIONAL_PROGRESS_CHANGED,
+  provisionalProgress,
+  scoredGames,
+} from "./ProvisionalProgress";
+import { steamSDK } from "./SteamSDK";
+import { playerProfileUrl } from "./utilities/PlayerProfileUrl";
+import { currentPagePath, translateText } from "./Utils";
+
+// Each login refusal says its own thing. Sharing one string was fine while
+// email_exists was the only recognised result; a player refused because their
+// account is pending deletion, or because a Steam OpenID response did not
+// verify, must not be told their email is already in use.
+const LOGIN_ERROR_KEYS: Record<LoginResult, string> = {
+  email_exists: "account_modal.login_email_exists",
+  deleted: "account_modal.login_deleted",
+  error: "account_modal.login_error",
+  no_account: "account_modal.login_no_account",
+};
+
+// The prestige confirmation and ceremony only ever open for a player at level
+// 100, so they stay out of the startup bundle: fetched as soon as the account
+// says the card will offer Prestige, well before the press. A failed fetch is
+// tried again on the next press.
+let prestigeFlowModule: Promise<unknown> | null = null;
+function loadPrestigeFlow(): Promise<unknown> {
+  prestigeFlowModule ??= import("./components/PrestigeFlow").catch(
+    (err: unknown) => {
+      prestigeFlowModule = null;
+      throw err;
+    },
+  );
+  return prestigeFlowModule;
+}
+
+// Every opening of the account, numbered: keys the once-per-opening
+// flourishes.
+let accountOpenings = 0;
+
+@customElement("account-modal")
+export class AccountModal extends BaseModal {
+  protected routerName = "account";
+
+  @state() private email: string = "";
+  @state() private isLoadingUser: boolean = false;
+  // Counts openings, to key the profile card's and the Progression tab's
+  // once-per-open flourish.
+  private openCount = 0;
+  // Replaceable for tests.
+  loadPrestigeFlow: () => Promise<unknown> = loadPrestigeFlow;
+  // The Progression tab's progress: the public one, which has the prestige
+  // history and milestones /users/@me lacks. Read the first time the tab
+  // shows in an opening, not on every opening of the account.
+  @state() private progression: PublicProgress | null = null;
+  // The player it was read (or is being read) for in this opening.
+  private progressionFor: string | null = null;
+  // Bumped on every read and drop, so a superseded read is ignored.
+  private progressionLoad = 0;
+  // The tab a link or caller asked for. BaseModal picks it when the tab is
+  // listed at open, but the tabs wait for the account: a modal loaded after
+  // the page's /users/@me broadcast doesn't know the player yet, and an
+  // opening lists none while it reads /users/@me. Picked once that lands.
+  private requestedTab: string | null = null;
+  // Set on a portal (CrazyGames, Poki) when its user is signed in. Their
+  // identity comes from the SDK, not our backend user object.
+  @state() private portalUser: PortalUser | null = null;
+  // One-shot outcome of a rejected sign-in, read from the `login=` router
+  // arg on open. Reassigned on every open, so reopening clears it.
+  @state() private loginError: LoginResult | undefined;
+  // One-shot prefill for the creator-code panel's unbound-state input, read
+  // from the `creatorCode=` router arg (a `/c/CODE` share-link visit).
+  // Reassigned on every open, same as loginError above.
+  @state() private prefillCreatorCode: string | undefined;
+
+  private userMeResponse: UserMeResponse | null = null;
+  private statsTree: PlayerStatsTree | null = null;
+  // The card's clan tag, from the player's own profile (displayClanTag).
+  private displayClanTag: string | null = null;
+  // Preserves the Games tab's accumulated list + cursor across tab switches.
+  private gameHistoryCache: PlayerGameHistoryCache | null = null;
+  private gamesScrollTop = 0;
+  private restoreGamesScrollAfterOpen = false;
+
+  constructor() {
+    super();
+
+    // The level shown counts XP from games still waiting to be scored, and
+    // that changed (ProvisionalProgress.ts).
+    document.addEventListener(PROVISIONAL_PROGRESS_CHANGED, (event) => {
+      if (scoredGames(event).length > 0) this.rereadProgression();
+      this.requestUpdate();
+    });
+
+    document.addEventListener("userMeResponse", (event: Event) => {
+      // A portal sign-in fires userMeResponse (via Main's auth listener);
+      // re-fetch the SDK profile so the modal leaves the sign-in screen.
+      this.refreshPortalUser();
+      const customEvent = event as CustomEvent;
+      if (customEvent.detail) {
+        const previousPublicId = this.userMeResponse?.player?.publicId;
+        this.userMeResponse = customEvent.detail as UserMeResponse;
+        this.prefetchPrestigeFlow();
+        // Reset whenever the player identity changes (login, or switching to a
+        // different account) so stats/history from the previous player don't
+        // linger.
+        if (this.userMeResponse?.player?.publicId !== previousPublicId) {
+          this.resetPlayerData();
+          this.requestUpdate();
+        }
+      } else {
+        this.resetPlayerData();
+        this.requestUpdate();
+      }
+    });
+  }
+
+  // Refresh the signed-in portal identity from the SDK. No-op off a
+  // portal; drives isLinkedAccount() so the modal shows the profile.
+  private refreshPortalUser() {
+    if (!gamePortal.isOnGamePortal()) return;
+    void gamePortal.getUserProfile().then((user) => {
+      this.portalUser = user;
+      this.requestUpdate();
+    });
+  }
+
+  private hasAnyStats(): boolean {
+    if (!this.statsTree) return false;
+    // Check if statsTree has any data
+    return (
+      Object.keys(this.statsTree).length > 0 &&
+      Object.values(this.statsTree).some(
+        (gameTypeStats) =>
+          gameTypeStats && Object.keys(gameTypeStats).length > 0,
+      )
+    );
+  }
+
+  protected renderHeaderSlot() {
+    const isLoggedIn = !!this.userMeResponse?.user;
+    const publicId = this.userMeResponse?.player?.publicId ?? "";
+    return modalHeader({
+      title: translateText("account_modal.title"),
+      onBack: () => this.close(),
+      ariaLabel: translateText("common.back"),
+      // Not on Poki: the profile link leads players off Poki.
+      rightContent:
+        isLoggedIn &&
+        !this.isLoadingUser &&
+        publicId &&
+        gamePortal.name() !== "poki"
+          ? html`
+              <copy-button
+                class="shrink-0"
+                .copyText=${playerProfileUrl(publicId)}
+                .displayText=${translateText("player_profile.share")}
+                .showVisibilityToggle=${false}
+              ></copy-button>
+            `
+          : undefined,
+    });
+  }
+
+  private isLinkedAccount(): boolean {
+    // The portal identity only counts once the backend token exchange
+    // produced a session — otherwise a failed exchange would show a dead
+    // "connected as" view with no way to retry.
+    return (
+      hasLinkedIdentity(this.userMeResponse?.user) ||
+      (!!this.portalUser && this.userMeResponse !== null)
+    );
+  }
+
+  protected modalConfig() {
+    if (this.isLoadingUser || !this.isLinkedAccount()) {
+      return {};
+    }
+    return {
+      tabs: [
+        { key: "account", label: translateText("account_modal.tab_account") },
+        { key: "stats", label: translateText("account_modal.tab_stats") },
+        { key: "games", label: translateText("account_modal.tab_games") },
+        // Where the player profile has it, after Games. Only for a player
+        // with a level (progression on), as on the profile: there is nothing
+        // to show otherwise.
+        ...(this.hasProgress()
+          ? [
+              {
+                key: "progression",
+                label: translateText("account_modal.tab_progression"),
+              },
+            ]
+          : []),
+        { key: "friends", label: translateText("account_modal.tab_friends") },
+      ],
+    };
+  }
+
+  private hasProgress(): boolean {
+    const player = this.userMeResponse?.player;
+    return !!player?.publicId && !!player.progress;
+  }
+
+  protected renderBody(tab: string) {
+    if (this.isLoadingUser) {
+      return this.renderLoadingSpinner(
+        translateText("account_modal.fetching_account"),
+      );
+    }
+    if (!this.isLinkedAccount()) {
+      return html`<div class="custom-scrollbar mr-1">
+        ${
+          gamePortal.isOnGamePortal()
+            ? this.renderPortalSignIn()
+            : this.renderLoginOptions()
+        }
+      </div>`;
+    }
+    return html`
+      <div class="custom-scrollbar mr-1">
+        <div class="p-6">${this.renderTab(tab)}</div>
+      </div>
+      <prestige-flow
+        .publicId=${this.userMeResponse?.player?.publicId ?? ""}
+        @prestiged=${this.handlePrestiged}
+        @prestige-stale=${this.handlePrestigeStale}
+      ></prestige-flow>
+    `;
+  }
+
+  private renderTab(tab: string): TemplateResult {
+    switch (tab) {
+      case "stats":
+        return this.renderStatsTab();
+      case "games":
+        return this.renderGamesTab();
+      case "progression":
+        return this.renderProgressionTab();
+      case "friends":
+        return this.renderFriendsTab();
+      default:
+        return this.renderAccountTab();
+    }
+  }
+
+  // Email input + "get magic link" button used by the sign-in form.
+  private renderEmailField(): TemplateResult {
+    return html`
+      <input
+        type="email"
+        .value=${this.email}
+        @input=${this.handleEmailInput}
+        placeholder=${translateText("account_modal.email_placeholder")}
+        class="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder-white/20 focus:outline-none focus:ring-2 focus:ring-malibu-blue/50 focus:border-malibu-blue/50 transition-all font-medium hover:bg-white/10"
+      />
+      <o-button
+        variant="primary"
+        width="block"
+        size="md"
+        translationKey="account_modal.get_magic_link"
+        @click=${this.handleSubmit}
+      ></o-button>
+    `;
+  }
+
+  private renderFriendsTab(): TemplateResult {
+    const myPublicId = this.userMeResponse?.player?.publicId ?? "";
+    return html`<friends-list
+      .myPublicId=${myPublicId}
+      @view-profile=${(e: CustomEvent<{ publicId: string }>) =>
+        this.openPlayerProfile(e.detail.publicId)}
+    ></friends-list>`;
+  }
+
+  private openPlayerProfile(publicId: string): void {
+    const profileModal = document.querySelector<
+      HTMLElement & { openFromAccount(publicId: string): void }
+    >("player-profile-modal");
+    profileModal?.openFromAccount(publicId);
+  }
+
+  public returnToFriends(): void {
+    this.open({ tab: "friends" });
+  }
+
+  private renderAccountTab(): TemplateResult {
+    if (this.portalUser) {
+      return this.renderPortalAccount(this.portalUser);
+    }
+    return html`
+      <div class="flex flex-col gap-6">
+        ${this.renderProfileCard("compact")}
+        <div class="bg-white/5 rounded-xl border border-white/10 p-6">
+          <div class="flex flex-col items-center gap-4">
+            <div
+              class="text-xs text-white/40 uppercase tracking-widest font-bold border-b border-white/5 pb-2 px-8"
+            >
+              ${translateText("account_modal.connected_as")}
+            </div>
+            <div class="flex items-center gap-8 justify-center flex-wrap">
+              <discord-user-header
+                .data=${this.userMeResponse?.user?.discord ?? null}
+              ></discord-user-header>
+              ${
+                this.userMeResponse?.user?.steam
+                  ? html`<steam-user-header
+                      .data=${this.userMeResponse.user.steam}
+                    ></steam-user-header>`
+                  : null
+              }
+              ${this.renderLoggedInAs()}
+            </div>
+          </div>
+        </div>
+        ${this.renderRewardsPanel()} ${this.renderCreatorCodePanel()}
+        ${this.renderDesktopLinkGateAction()}
+      </div>
+    `;
+  }
+
+  // Re-entry to the desktop shell's account-linking gate shown at first
+  // launch. Absent entirely on plain web (no window.openfrontDesktop there),
+  // present whenever the desktop bridge exposes a callable showLinkGate —
+  // see desktopLinkGate() in DesktopShell.ts for why the guard is scoped
+  // that way. Needed because the desktop app's menu bar will eventually be
+  // hidden and the game runs fullscreen borderless, so a dismissed or
+  // since-linked player needs another way back to that gate.
+  private renderDesktopLinkGateAction(): TemplateResult | typeof nothing {
+    if (desktopLinkGate() === null) return nothing;
+    return html`
+      <o-button
+        variant="secondary"
+        width="block"
+        size="md"
+        translationKey="account_modal.link_existing_account"
+        @click=${this.handleShowLinkGate}
+      ></o-button>
+    `;
+  }
+
+  private handleShowLinkGate(): void {
+    // The bare `void` form swallowed a rejection into an unhandled promise.
+    // This is an IPC round trip to the Electron main process, so it can
+    // genuinely reject (no window, a main-process throw); catching keeps the
+    // failure visible in the console instead of surfacing as a button that
+    // silently does nothing.
+    desktopLinkGate()
+      ?.showLinkGate()
+      .catch((err) => {
+        console.error("AccountModal: showLinkGate failed", err);
+      });
+  }
+
+  // Portal "connected as" view: avatar + username from the SDK, plus
+  // currency/subscription. No Discord/Google/email link or logout (the portal
+  // owns the account and its logout).
+  private renderPortalAccount(user: PortalUser): TemplateResult {
+    return html`
+      <div class="flex flex-col gap-6">
+        ${this.renderProfileCard("compact")}
+        <div class="bg-white/5 rounded-xl border border-white/10 p-6">
+          <div class="flex flex-col items-center gap-4">
+            <div
+              class="text-xs text-white/40 uppercase tracking-widest font-bold border-b border-white/5 pb-2 px-8"
+            >
+              ${translateText("account_modal.connected_as")}
+            </div>
+            <div class="flex flex-col items-center gap-3">
+              <img
+                src=${user.profilePictureUrl}
+                alt=${user.username}
+                class="w-16 h-16 rounded-full object-cover"
+                referrerpolicy="no-referrer"
+              />
+              <div class="text-white text-lg font-medium">${user.username}</div>
+              ${this.renderCurrency()}
+            </div>
+          </div>
+        </div>
+        ${this.renderRewardsPanel()}
+      </div>
+    `;
+  }
+
+  // Shown when a portal guest opens the modal: hand off to the portal's own
+  // sign-in prompt (no Discord/Google/email on a portal).
+  private renderPortalSignIn(): TemplateResult {
+    return html`
+      <div class="flex items-center justify-center p-6 min-h-full">
+        <div
+          class="w-full max-w-md bg-white/5 rounded-2xl border border-white/10 p-8 text-center"
+        >
+          <p class="text-white/50 text-sm font-medium mb-6">
+            ${translateText("account_modal.sign_in_desc")}
+          </p>
+          <o-button
+            variant="primary"
+            width="block"
+            size="md"
+            translationKey="main.sign_in"
+            @click=${this.handlePortalSignIn}
+          ></o-button>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderStatsTab(): TemplateResult {
+    return html`
+      ${this.renderProfileCard("full")}
+      ${
+        this.hasAnyStats()
+          ? html`<player-stats-tree-view
+              .statsTree=${this.statsTree}
+            ></player-stats-tree-view>`
+          : this.renderEmptyState("📊", translateText("account_modal.no_stats"))
+      }
+    `;
+  }
+
+  private renderGamesTab(): TemplateResult {
+    const publicId = this.userMeResponse?.player?.publicId ?? "";
+    if (!publicId) {
+      return this.renderEmptyState(
+        "🎮",
+        translateText("account_modal.no_games"),
+      );
+    }
+    return html`
+      <player-game-history-view
+        .publicId=${publicId}
+        .cachedState=${
+          this.gameHistoryCache?.publicId === publicId
+            ? this.gameHistoryCache
+            : null
+        }
+        @history-updated=${(e: CustomEvent<PlayerGameHistoryCache>) => {
+          this.gameHistoryCache = e.detail;
+        }}
+        @view-stats=${(e: CustomEvent<{ gameId: string }>) =>
+          this.openGameStats(e.detail.gameId)}
+        @view-game=${(e: CustomEvent<{ gameId: string }>) =>
+          void this.viewGame(e.detail.gameId)}
+      ></player-game-history-view>
+    `;
+  }
+
+  // The player profile's Progression tab, for the signed-in player: the same
+  // element, in its owner mode (it reads /users/@me afresh, so the track
+  // shows each level's claim status and offers Claim all), and the same
+  // once-per-opening pop-in.
+  private renderProgressionTab(): TemplateResult {
+    const publicId = this.userMeResponse?.player?.publicId;
+    // The tab is hidden without progress; should it still be selected (the
+    // account changed underneath), show the Account content rather than
+    // nothing.
+    if (!publicId || !this.hasProgress()) return this.renderAccountTab();
+    if (this.progression === null) {
+      return this.renderLoadingSpinner(translateText("common.loading"));
+    }
+    // With any XP still waiting to be scored, provisionally.
+    const view = provisionalProgress(publicId, this.progression);
+    return html`<profile-progression
+      .progress=${view.progress}
+      .confirmedLevel=${view.confirmedLevel}
+      .provisional=${view.provisional}
+      .publicId=${publicId}
+      .popKey=${`account-${this.openCount}`}
+      @rewards-changed=${this.handleTrackRewardsChanged}
+    ></profile-progression>`;
+  }
+
+  protected updated(changed: PropertyValues<this>): void {
+    super.updated(changed);
+    this.ensureProgression();
+  }
+
+  // Reads the Progression tab's progress once it shows: once per opening
+  // (the level moves on between openings), and again after a prestige.
+  private ensureProgression(): void {
+    if (this.activeTab !== "progression" || this.isLoadingUser) return;
+    if (!this.isOpen() || !this.hasProgress()) return;
+    const publicId = this.userMeResponse!.player.publicId;
+    if (this.progressionFor === publicId) return;
+    this.progressionFor = publicId;
+    this.progression = null;
+    const load = ++this.progressionLoad;
+    void loadPlayerProgress(publicId).then((progress) => {
+      if (load !== this.progressionLoad) return;
+      // The public read failed: the account's own copy still has the level
+      // and run (without dates), so the tab never sits on its spinner.
+      this.progression =
+        progress ?? this.userMeResponse?.player?.progress ?? null;
+    });
+  }
+
+  // Read afresh the next time the tab shows.
+  private dropProgression(): void {
+    this.progressionLoad++;
+    this.progressionFor = null;
+    this.progression = null;
+  }
+
+  // A pending game was scored: read the tab's progress again, for its
+  // history and milestones. The level holds meanwhile (and on a stale read):
+  // the scored game's XP counts onto any figure that doesn't include it yet
+  // (ProvisionalProgress.ts).
+  private rereadProgression(): void {
+    const publicId = this.progressionFor;
+    if (publicId === null || this.progression === null) return;
+    // Closed, it's read afresh at the next opening anyway.
+    if (!this.isConnected || !this.isOpen()) return;
+    const load = ++this.progressionLoad;
+    void loadPlayerProgress(publicId).then((progress) => {
+      if (load !== this.progressionLoad || progress === null) return;
+      this.progression = progress;
+    });
+  }
+
+  // The track's Claim all moved rewards into the balances. Update the
+  // account's own copy, as a rewards-panel claim does (the Account tab's
+  // rewards list), then re-read /users/@me and tell the page, as a prestige
+  // does: the header's account menu among them.
+  private handleTrackRewardsChanged = (
+    event: CustomEvent<RewardsChangedDetail>,
+  ): void => {
+    this.handleRewardsChanged(event);
+    void this.refreshUserMe().then(() => this.requestUpdate());
+  };
+
+  private renderEmptyState(icon: string, message: string): TemplateResult {
+    return html`
+      <div
+        class="bg-white/5 rounded-xl border border-white/10 p-12 flex flex-col items-center justify-center text-center"
+      >
+        <div class="text-4xl mb-3">${icon}</div>
+        <p class="text-white/60 text-sm">${message}</p>
+      </div>
+    `;
+  }
+
+  private renderRewardsPanel(): TemplateResult | "" {
+    const rewards = this.userMeResponse?.player?.rewards ?? [];
+    if (rewards.length === 0) return "";
+    return html`<rewards-panel
+      .rewards=${rewards}
+      .signedIn=${
+        responseHasLinkedIdentity(this.userMeResponse ?? false) ||
+        this.portalUser !== null
+      }
+      @rewards-changed=${this.handleRewardsChanged}
+    ></rewards-panel>`;
+  }
+
+  // Not rendered on the portal account branch (renderPortalAccount) — the
+  // portal identity comes from the SDK, not the /users/@me `player`
+  // record this panel reads its state from.
+  private renderCreatorCodePanel(): TemplateResult {
+    return html`<creator-code-panel
+      .creator=${this.userMeResponse?.player?.creator}
+      .prefillCode=${this.prefillCreatorCode}
+      @creator-changed=${this.handleCreatorChanged}
+    ></creator-code-panel>`;
+  }
+
+  // A claim moved unclaimed rewards into the balances; both were returned by
+  // the claim endpoint, so update in place instead of re-fetching /users/@me.
+  private handleRewardsChanged = (
+    event: CustomEvent<RewardsChangedDetail>,
+  ): void => {
+    if (!this.userMeResponse) return;
+    this.userMeResponse.player.rewards = event.detail.rewards;
+    if (event.detail.currency) {
+      this.userMeResponse.player.currency = event.detail.currency;
+    }
+    this.requestUpdate();
+  };
+
+  // The panel already re-fetched /users/@me itself (its mutating calls
+  // invalidate the cache) after a successful set/switch/unsupport — patch the
+  // fresh creator field into our own cached copy in place, same idiom as
+  // handleRewardsChanged above, rather than reloading the page.
+  private handleCreatorChanged = (
+    event: CustomEvent<CreatorChangedDetail>,
+  ): void => {
+    if (!this.userMeResponse) return;
+    this.userMeResponse.player.creator = event.detail.creator;
+    // One-shot: a share-link prefill must not reappear in the input after the
+    // player has bound or unbound a creator in this session.
+    this.prefillCreatorCode = undefined;
+    this.requestUpdate();
+  };
+
+  // Your level at a glance, the way a shared profile link shows it: one row
+  // on the account page, the full card heading the Stats tab. Nothing while
+  // progression is off.
+  private renderProfileCard(
+    variant: "full" | "compact",
+  ): TemplateResult | typeof nothing {
+    const player = this.userMeResponse?.player;
+    if (!player?.publicId || !player.progress) return nothing;
+    // With any XP still waiting to be scored, provisionally: it never offers
+    // Prestige (only the confirmed level can).
+    const view = provisionalProgress(player.publicId, player.progress);
+    return html`<profile-card
+      class=${variant === "full" ? "mb-4 block" : "block"}
+      .variant=${variant}
+      .username=${player.username ?? player.publicId}
+      .clanTag=${this.displayClanTag}
+      .progress=${view.progress}
+      .provisional=${view.provisional}
+      .openKey=${`account-${this.openCount}`}
+      prestigeable
+      @prestige-request=${this.handlePrestigeRequest}
+    ></profile-card>`;
+  }
+
+  // Fetches the prestige flow when /users/@me says the card will offer
+  // Prestige, so it's there by the press.
+  private prefetchPrestigeFlow(): void {
+    if (!this.userMeResponse?.player?.progress?.canPrestige) return;
+    this.loadPrestigeFlow().catch((err: unknown) =>
+      console.warn("AccountModal: prestige flow failed to load", err),
+    );
+  }
+
+  private handlePrestigeRequest = async (): Promise<void> => {
+    if (!this.userMeResponse?.player?.progress) return;
+    try {
+      // Normally loaded already (see prefetchPrestigeFlow).
+      await this.loadPrestigeFlow();
+    } catch (err) {
+      console.warn("AccountModal: prestige flow failed to load", err);
+      await showInGameAlert(translateText("prestige.load_failed"));
+      return;
+    }
+    // The account as it is now: it may have been re-read meanwhile.
+    const progress = this.userMeResponse?.player?.progress;
+    if (!progress) return;
+    this.querySelector<PrestigeFlow>("prestige-flow")?.open(progress);
+  };
+
+  // The server has prestiged the player: show the new rank behind the
+  // ceremony, list the rewards it granted, and drop the cached /users/@me.
+  private handlePrestiged = (event: CustomEvent<PrestigeResponse>): void => {
+    if (!this.userMeResponse) return;
+    const player = this.userMeResponse.player;
+    player.progress = event.detail.progress;
+    // A replayed answer can list a reward this page already holds.
+    const held = new Set((player.rewards ?? []).map((r) => r.id));
+    const added = event.detail.rewards.filter((r) => !held.has(r.id));
+    if (added.length > 0) {
+      player.rewards = [...(player.rewards ?? []), ...added];
+    }
+    // A new run: the Progression tab's history and track moved on.
+    this.dropProgression();
+    this.requestUpdate();
+    // Then the real thing, for the header and everything else showing the
+    // account.
+    void this.refreshUserMe();
+  };
+
+  // The server says the player can't prestige from where this page thinks
+  // they are: most likely an earlier prestige whose answer never arrived.
+  // Reload the account so the card shows where they really are, and say so.
+  private handlePrestigeStale = async (): Promise<void> => {
+    const fresh = await this.refreshUserMe();
+    await showInGameAlert(
+      fresh === false
+        ? translateText("prestige.stale_failed")
+        : translateText("prestige.stale"),
+    );
+  };
+
+  // Re-reads /users/@me and tells the rest of the page (the header's account
+  // menu among them), as a purchase does. This modal listens too, so its own
+  // copy updates with it. A failed read leaves everything as it is rather
+  // than broadcasting a signed-out state.
+  private async refreshUserMe(): Promise<UserMeResponse | false> {
+    invalidateUserMe();
+    const fresh = await getUserMe();
+    if (fresh === false) return false;
+    document.dispatchEvent(
+      new CustomEvent("userMeResponse", {
+        detail: fresh,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    return fresh;
+  }
+
+  // Escape belongs to the prestige confirmation or ceremony while it's up,
+  // not to the page behind it.
+  public confirmBeforeClose(): boolean | Promise<boolean> {
+    if (this.querySelector<PrestigeFlow>("prestige-flow")?.isOpen) {
+      return false;
+    }
+    return super.confirmBeforeClose();
+  }
+
+  private renderCurrency(): TemplateResult {
+    const currency = this.userMeResponse?.player?.currency;
+    if (!currency) return html``;
+
+    return html`
+      <currency-display
+        .hard=${currency.hard}
+        .soft=${currency.soft}
+      ></currency-display>
+    `;
+  }
+
+  private renderLoggedInAs(): TemplateResult {
+    const me = this.userMeResponse?.user;
+    if (me?.discord) {
+      return html`
+        <div class="flex flex-col items-center gap-3 w-full">
+          ${this.renderCurrency()} ${this.renderGoogleLink()}
+          ${this.renderSteamLink()}
+        </div>
+      `;
+    } else if (me?.google) {
+      return html`
+        <div class="flex flex-col items-center gap-3 w-full">
+          <div class="text-white text-lg font-medium">
+            ${translateText("account_modal.linked_account", {
+              account_name: me.google.email,
+            })}
+          </div>
+          ${this.renderCurrency()} ${this.renderSteamLink()}
+        </div>
+      `;
+    } else if (me?.email) {
+      return html`
+        <div class="flex flex-col items-center gap-3 w-full">
+          <div class="text-white text-lg font-medium">
+            ${translateText("account_modal.linked_account", {
+              account_name: me.email,
+            })}
+          </div>
+          ${this.renderCurrency()} ${this.renderGoogleLink()}
+          ${this.renderSteamLink()}
+        </div>
+      `;
+    } else if (me?.steam) {
+      // Steam is the primary login and v1 does not support linking a second
+      // identity or unlinking Steam itself, so no Discord/Google CTA here —
+      // just the currency balance and (session) logout.
+      return html`
+        <div class="flex flex-col items-center gap-3 w-full">
+          ${this.renderCurrency()}
+        </div>
+      `;
+    }
+    return html``;
+  }
+
+  // Show the Google link state: a confirmation line when a Google account is
+  // already linked, otherwise the button to link one.
+  private renderGoogleLink(): TemplateResult {
+    const google = this.userMeResponse?.user?.google;
+    if (google) {
+      const label = google.email
+        ? translateText("account_modal.linked_to_google_email", {
+            email: google.email,
+          })
+        : translateText("account_modal.linked_to_google");
+      return html`
+        <div class="flex items-center gap-2 text-white/70 text-sm">
+          <img
+            src=${assetUrl("images/GoogleLogo.svg")}
+            alt=${translateText("account_modal.google_alt")}
+            class="w-4 h-4"
+          />
+          <span>${label}</span>
+        </div>
+      `;
+    }
+    return this.renderLinkGoogleButton();
+  }
+
+  // Shown when logged in without a Google identity yet. Lets the user attach
+  // Google to their existing account (we never auto-merge by email).
+  private renderLinkGoogleButton(): TemplateResult {
+    if (this.userMeResponse?.user?.google) return html``;
+    return googleLinkButton(
+      this.handleLinkGoogle,
+      // The shell sends the player to the website for this (see linkGoogle
+      // in Auth.ts); the caption has to say so.
+      isDesktopShell()
+        ? "account_modal.link_google_on_web"
+        : "account_modal.link_google",
+    );
+  }
+
+  // Steam link state (OPE-115): the linked account when there is one,
+  // otherwise the button to link one.
+  //
+  // NOTE THE ASYMMETRY WITH GOOGLE, WHICH IS DELIBERATE: there is no unlink
+  // control here, and there is a permanence warning on the button. Steam
+  // recommends that users cannot self-unlink Steam from an external account,
+  // so this is a one-way change that only support can reverse — the warning
+  // has to be readable BEFORE the click, because afterwards the link exists.
+  //
+  // Not shown inside the desktop shell: a shell player already holds this
+  // identity through the native Steam ticket.
+  private renderSteamLink(): TemplateResult {
+    if (isDesktopShell()) return html``;
+    const steam = this.userMeResponse?.user?.steam;
+    if (steam) {
+      // The attached account is NAMED, not merely reported as linked: a wrong
+      // link — the player's browser was signed into someone else's Steam when
+      // they clicked — cannot be undone by them, so noticing it immediately is
+      // the difference between a quick support fix and a permanent one.
+      // Steam's own consent page is the first defence; this is the second.
+      //
+      // The persona and avatar come from the <steam-user-header> that
+      // renderAccountTab already renders whenever user.steam is set, for every
+      // branch including Steam-primary. Rendering a second one here showed it
+      // TWICE to exactly the players this row is for — anyone Discord-,
+      // Google- or email-primary with Steam linked.
+      return html`
+        <div class="flex flex-col items-center gap-1">
+          <div class="flex items-center gap-2 text-white/70 text-sm">
+            ${steamGlyph("w-4 h-4 shrink-0")}
+            <span>${translateText("account_modal.linked_to_steam")}</span>
+          </div>
+          <span class="text-white/40 text-xs text-center">
+            ${translateText("account_modal.link_steam_permanent")}
+          </span>
+        </div>
+      `;
+    }
+    return html`
+      <div class="w-full flex flex-col gap-1">
+        ${steamLinkButton(this.handleLinkSteam)}
+        <span class="text-white/40 text-xs text-center">
+          ${translateText("account_modal.link_steam_permanent")}
+        </span>
+      </div>
+    `;
+  }
+
+  private handleLinkSteam = async (): Promise<void> => {
+    // On success linkSteam navigates to Steam; the result comes back as a
+    // `link=...` router arg handled by consumeLinkResult. A false return means
+    // we couldn't start it.
+    const started = await linkSteam();
+    if (!started) {
+      await showInGameAlert(translateText("account_modal.link_steam_failed"));
+    }
+  };
+
+  private async viewGame(gameId: string): Promise<void> {
+    this.close();
+    const encodedGameId = encodeURIComponent(gameId);
+    const newUrl = currentPagePath(ClientEnv.gamePath(gameId));
+
+    history.pushState({ join: gameId }, "", newUrl);
+    window.dispatchEvent(
+      new CustomEvent("join-changed", { detail: { gameId: encodedGameId } }),
+    );
+  }
+
+  private openGameStats(gameId: string): void {
+    this.gamesScrollTop = this.modalEl?.getScrollTop() ?? 0;
+    const statsModal = document.querySelector<
+      HTMLElement & { openFromAccount(gameId: string): void }
+    >("game-stats-modal");
+    statsModal?.openFromAccount(gameId);
+  }
+
+  public returnToGames(): void {
+    this.restoreGamesScrollAfterOpen = true;
+    this.open({ tab: "games" });
+  }
+
+  private async restoreGamesScroll(): Promise<void> {
+    await this.updateComplete;
+    await this.modalEl?.updateComplete;
+    const historyView = this.querySelector<
+      HTMLElement & { updateComplete?: Promise<boolean> }
+    >("player-game-history-view");
+    await historyView?.updateComplete;
+    this.modalEl?.setScrollTop(this.gamesScrollTop);
+  }
+
+  private finishLoadingUser(opening: number): void {
+    if (opening !== this.openCount) return;
+    this.isLoadingUser = false;
+    this.requestUpdate();
+    // The tabs are listed now: pick the one asked for, if this account has
+    // it (the Progression tab needs a level). The modal can have been closed
+    // meanwhile; the tab is then left for the next opening to decide.
+    const tab = this.requestedTab;
+    this.requestedTab = null;
+    if (tab !== null && this.isOpen()) this.setActiveTab(tab);
+    if (this.restoreGamesScrollAfterOpen) {
+      this.restoreGamesScrollAfterOpen = false;
+      void this.restoreGamesScroll();
+    }
+  }
+
+  private resetPlayerData(): void {
+    this.statsTree = null;
+    this.displayClanTag = null;
+    this.dropProgression();
+    this.gameHistoryCache = null;
+    this.gamesScrollTop = 0;
+    this.restoreGamesScrollAfterOpen = false;
+  }
+
+  // Shown when a sign-in was rejected because the provider's verified email
+  // already belongs to an account. We deliberately don't name which provider
+  // that account uses — the visitor has only proven control of the email.
+  private renderLoginError(): TemplateResult {
+    if (this.loginError === undefined) return html``;
+    return html`
+      <div
+        class="mb-6 flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4"
+      >
+        <span class="text-red-400 text-lg leading-none" aria-hidden="true">
+          &#9888;
+        </span>
+        <p class="flex-1 text-sm text-red-200">
+          ${translateText(LOGIN_ERROR_KEYS[this.loginError])}
+        </p>
+        <button
+          class="text-red-200/60 hover:text-red-200 text-lg leading-none"
+          aria-label=${translateText("common.close")}
+          @click=${() => (this.loginError = undefined)}
+        >
+          &times;
+        </button>
+      </div>
+    `;
+  }
+
+  private renderLoginOptions() {
+    // On the desktop shell both provider buttons open the shell's browser
+    // link flow rather than an in-place OAuth redirect (see discordLogin /
+    // googleLogin in Auth.ts), and the captions say so. Keyed on the shell
+    // itself, not on the link-flow bridge: Auth.ts never builds the redirect
+    // on ANY desktop shell (a shell too old to expose showLinkGate gets an
+    // update prompt instead), so the web caption would be wrong on every one
+    // of them.
+    const viaBrowser = isDesktopShell();
+    return html`
+      <div class="flex items-center justify-center p-6 min-h-full">
+        <div
+          class="w-full max-w-md bg-white/5 rounded-2xl border border-white/10 p-8"
+        >
+          <div class="text-center mb-8">
+            <div
+              class="w-16 h-16 bg-gradient-to-br from-blue-500/20 to-purple-500/20 rounded-2xl flex items-center justify-center mx-auto mb-6 border border-white/10 shadow-inner"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class="w-8 h-8 text-blue-400"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path>
+                <polyline points="10 17 15 12 10 7"></polyline>
+                <line x1="15" y1="12" x2="3" y2="12"></line>
+              </svg>
+            </div>
+            <p class="text-white/50 text-sm font-medium">
+              ${translateText("account_modal.sign_in_desc")}
+            </p>
+            ${
+              viaBrowser
+                ? html`<p class="text-white/40 text-xs">
+                    ${translateText("account_modal.desktop_sign_in_desc")}
+                  </p>`
+                : nothing
+            }
+            ${this.renderCurrency()}
+          </div>
+
+          ${this.renderLoginError()}
+
+          <div class="space-y-6">
+            <!-- Discord Login Button -->
+            <button
+              @click="${this.handleDiscordLogin}"
+              class="w-full px-6 py-4 text-white bg-[#5865F2] hover:bg-[#4752C4] border border-transparent rounded-xl focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#5865F2] transition-colors duration-200 flex items-center justify-center gap-3 group relative overflow-hidden shadow-lg hover:shadow-[#5865F2]/20"
+            >
+              <img
+                src=${assetUrl("images/DiscordLogo.svg")}
+                alt="Discord"
+                class="w-6 h-6 relative z-10"
+              />
+              <span class="font-bold relative z-10 tracking-wide"
+                >${
+                  viaBrowser
+                    ? translateText("account_modal.desktop_login_discord")
+                    : translateText("main.login_discord") ||
+                      translateText("account_modal.link_discord")
+                }</span
+              >
+            </button>
+
+            <!-- Google Login Button (Google brand guidelines: white surface,
+                 dark text, the multicolor "G" mark) -->
+            <button
+              @click="${this.handleGoogleLogin}"
+              class="w-full px-6 py-4 text-[#1f1f1f] bg-white hover:bg-[#f7f8f8] border border-[#dadce0] rounded-xl focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#4285F4] transition-colors duration-200 flex items-center justify-center gap-3 group relative overflow-hidden shadow-lg"
+            >
+              <img
+                src=${assetUrl("images/GoogleLogo.svg")}
+                alt=${translateText("account_modal.google_alt")}
+                class="w-6 h-6 relative z-10"
+              />
+              <span class="font-bold relative z-10 tracking-wide"
+                >${
+                  viaBrowser
+                    ? translateText("account_modal.desktop_login_google")
+                    : translateText("main.login_google")
+                }</span
+              >
+            </button>
+
+            <!-- Sign in through Steam. Hidden inside the desktop shell: the
+                 player is already signed in there through the native Steam
+                 ticket, so the button would be a no-op that looks like an
+                 option. -->
+            ${
+              viaBrowser
+                ? nothing
+                : html`<button
+                    @click="${this.handleSteamLogin}"
+                    class="w-full px-6 py-4 text-white bg-[#1b2838] hover:bg-[#2a475e] border border-[#66c0f4]/30 rounded-xl focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#66c0f4] transition-colors duration-200 flex items-center justify-center gap-3 shadow-lg"
+                  >
+                    ${steamGlyph("w-6 h-6 shrink-0")}
+                    <span class="font-bold tracking-wide"
+                      >${translateText("main.login_steam")}</span
+                    >
+                  </button>`
+            }
+
+            <!-- Divider -->
+            <div class="flex items-center gap-4 py-2">
+              <div class="h-px bg-white/10 flex-1"></div>
+              <span
+                class="text-[10px] uppercase tracking-widest text-white/30 font-bold"
+              >
+                ${translateText("account_modal.or")}
+              </span>
+              <div class="h-px bg-white/10 flex-1"></div>
+            </div>
+
+            <!-- Email Recovery -->
+            <div class="space-y-3">${this.renderEmailField()}</div>
+          </div>
+
+          <!-- Not on Steam: the Steam ticket re-creates the session on reload. -->
+          ${
+            steamSDK.isOnSteam()
+              ? nothing
+              : html`<div
+                  class="mt-8 text-center border-t border-white/10 pt-6"
+                >
+                  <button
+                    @click="${this.handleLogout}"
+                    class="text-[10px] font-bold text-white/20 hover:text-red-400 transition-colors uppercase tracking-widest pb-0.5"
+                  >
+                    ${translateText("account_modal.clear_session")}
+                  </button>
+                </div>`
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  private handleEmailInput(e: Event) {
+    const target = e.target as HTMLInputElement;
+    this.email = target.value;
+  }
+
+  private async handleSubmit() {
+    if (!this.email) {
+      await showInGameAlert(translateText("account_modal.enter_email_address"));
+      return;
+    }
+
+    const success = await sendMagicLink(this.email);
+    await showInGameAlert(
+      success
+        ? translateText("account_modal.recovery_email_sent", {
+            email: this.email,
+          })
+        : translateText("account_modal.failed_to_send_recovery_email"),
+    );
+  }
+
+  // Portal sign-in: after their prompt completes, exchange the new token
+  // for a session and refresh the modal so it shows the signed-in profile.
+  private async handlePortalSignIn() {
+    await gamePortal.showAuthPrompt();
+    const profile = await gamePortal.getUserProfile();
+    if (!profile) return; // prompt cancelled / still not signed in
+    invalidateUserMe();
+    await reauthAfterPortalChange();
+    const userMe = await getUserMe();
+    if (userMe) {
+      this.userMeResponse = userMe;
+      this.prefetchPrestigeFlow();
+    }
+    this.portalUser = profile;
+    this.requestUpdate();
+  }
+
+  private handleDiscordLogin() {
+    discordLogin();
+  }
+
+  private handleGoogleLogin() {
+    googleLogin();
+  }
+
+  private handleSteamLogin() {
+    steamLogin();
+  }
+
+  private handleLinkGoogle = async (): Promise<void> => {
+    // On success linkGoogle navigates to Google; the result comes back as a
+    // `link=...` router arg handled by consumeLinkResult. A false return
+    // means we couldn't start it.
+    const started = await linkGoogle();
+    if (!started) {
+      await showInGameAlert(translateText("account_modal.link_google_failed"));
+    }
+  };
+
+  // Reads the one-shot `creatorCode=` router arg and strips it from the URL,
+  // same idiom as consumeLoginResult above — a refresh or re-open must not
+  // replay a stale prefill into the (by-then possibly bound) panel.
+  private consumeCreatorCodeArg(
+    args?: Record<string, unknown>,
+  ): string | undefined {
+    const code =
+      typeof args?.creatorCode === "string" ? args.creatorCode : undefined;
+    // Empty string counts as absent, same as undefined: a bare
+    // `creatorCode=` in the hash (or an upstream edge case that resolves to
+    // "") must never reach the panel as a prefill -- normalizeCreatorCodeInput
+    // would reject it as too short and the panel would show a spurious
+    // "invalid code" error for a player who never actually had one.
+    if (!code) return undefined;
+
+    const params = new URLSearchParams(window.location.hash.slice(1));
+    params.delete("creatorCode");
+    const rest = params.toString();
+    history.replaceState(
+      null,
+      "",
+      rest ? `#${rest}` : window.location.pathname + window.location.search,
+    );
+
+    return code;
+  }
+
+  protected onOpen(args?: Record<string, unknown>): void {
+    // A new opening: the full profile card and the Progression tab play
+    // their flourish again, and the tab reads the player's progress afresh.
+    // Counted across every account modal, as the profile counts its own, so
+    // no two openings share a key.
+    const opening = (this.openCount = ++accountOpenings);
+    this.dropProgression();
+    this.isLoadingUser = true;
+    this.requestedTab = typeof args?.tab === "string" ? args.tab : null;
+    consumeLinkResult(args);
+    this.loginError = consumeLoginResult(args);
+    this.prefillCreatorCode = this.consumeCreatorCodeArg(args);
+
+    this.refreshPortalUser();
+
+    void getUserMe()
+      .then((userMe) => {
+        if (userMe) {
+          this.userMeResponse = userMe;
+          this.prefetchPrestigeFlow();
+          if (this.userMeResponse?.player?.publicId) {
+            this.loadPlayerProfile(this.userMeResponse.player.publicId);
+          }
+        }
+        this.finishLoadingUser(opening);
+      })
+      .catch((err) => {
+        console.warn("Failed to fetch user info in AccountModal.open():", err);
+        this.finishLoadingUser(opening);
+      });
+    this.requestUpdate();
+  }
+
+  protected onClose(): void {
+    this.dispatchEvent(
+      new CustomEvent("close", { bubbles: true, composed: true }),
+    );
+  }
+
+  private async handleLogout() {
+    await logOut();
+    this.close();
+    // Refresh the page after logout to update the UI state
+    window.location.reload();
+  }
+
+  private async loadPlayerProfile(publicId: string): Promise<void> {
+    try {
+      const data = await fetchPlayerById(publicId);
+      if (!data) {
+        this.requestUpdate();
+        return;
+      }
+
+      this.statsTree = data.stats;
+      this.displayClanTag = data.displayClanTag ?? null;
+
+      this.requestUpdate();
+    } catch (err) {
+      console.warn("Failed to load player data:", err);
+      this.requestUpdate();
+    }
+  }
+}

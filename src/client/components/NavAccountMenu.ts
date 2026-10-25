@@ -1,0 +1,969 @@
+import { Progress, UserMeResponse } from "@openfront/shared/ApiSchemas";
+import {
+  html,
+  LitElement,
+  nothing,
+  PropertyValues,
+  render,
+  TemplateResult,
+} from "lit";
+import { customElement, property, state } from "lit/decorators.js";
+import { ifDefined } from "lit/directives/if-defined.js";
+import { hasLinkedIdentity } from "../AccountIdentity";
+import { logOut } from "../Auth";
+import { gamePortal, type PortalUser } from "../GamePortal";
+import { showInGameConfirm } from "../InGameModal";
+import {
+  latestUserMeResponse,
+  updateAccountNavButton,
+} from "../NavAccountButton";
+import { closeMobileSidebar } from "../Navigation";
+import { levelFraction } from "../Progression";
+import {
+  PROVISIONAL_PROGRESS_CHANGED,
+  provisionalProgress,
+} from "../ProvisionalProgress";
+import { steamSDK } from "../SteamSDK";
+import { playerProfileUrl } from "../utilities/PlayerProfileUrl";
+import { copyToClipboard, showToast, translateText } from "../Utils";
+import { levelBadgeLabel } from "./LevelBadge";
+import { xpBar, xpProgressText } from "./XpBar";
+
+// The account bar catching up after a game: how long the fill takes to the
+// end of the old level and then to the new progress, and the badge's pop as
+// the level ticks over.
+export const NAV_CATCH_UP_MS = 700;
+export const NAV_LEVEL_POP_MS = 560;
+
+type NavCatchUp = "snap" | "grow" | "level_up";
+
+/**
+ * How the trigger moves from the progress it shows to a refreshed one: it
+ * animates only when the new one is higher (more lifetime XP) and someone
+ * can see it happen: this menu on screen, the page visible, motion allowed.
+ * Within a level the bar grows; across one it fills, the level ticks over
+ * and it grows again. Everything else (the first progress, a lower or equal
+ * one, a prestige) just snaps.
+ */
+export function navCatchUp(
+  shown: Progress | null,
+  next: Progress | null,
+  env: { onScreen: boolean; pageVisible: boolean; reducedMotion: boolean },
+): NavCatchUp {
+  if (shown === null || next === null) return "snap";
+  if (!(next.lifetimeXp > shown.lifetimeXp)) return "snap";
+  if (!env.onScreen || !env.pageVisible || env.reducedMotion) return "snap";
+  return next.level === shown.level && next.prestige === shown.prestige
+    ? "grow"
+    : "level_up";
+}
+
+function prefersReducedMotion(): boolean {
+  try {
+    return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  } catch {
+    return false;
+  }
+}
+
+type MenuItem = {
+  key: string;
+  labelKey: string;
+  icon: TemplateResult;
+  onSelect: () => void;
+  danger?: boolean;
+};
+
+/**
+ * The nav profile control: the account avatar/sign-in trigger plus, once signed
+ * in, a chevron that opens the account menu (account settings, username,
+ * subscription, log out). Game settings are a top-level nav item, not a menu
+ * entry.
+ *
+ * The trigger keeps `nav-menu-item[data-page="page-account"]`, so the signed-out
+ * state still falls through to Navigation's delegated router and opens the
+ * account modal. Signed in, the click is intercepted here and toggles the menu
+ * instead.
+ *
+ * `variant="desktop"` also carries the legacy element ids the imperative
+ * updaters (NavAccountButton, PortalAccountButton) drive; every instance
+ * additionally exposes `data-account-*` hooks so both trigger layouts stay in
+ * sync from one update call.
+ */
+@customElement("nav-account-menu")
+export class NavAccountMenu extends LitElement {
+  @property({ type: String }) variant: "desktop" | "mobile" = "desktop";
+
+  @state() private menuOpen = false;
+  @state() private userMeResponse: UserMeResponse | false = false;
+  // Portal identities come from the SDK, not our user object.
+  @state() private portalUser: PortalUser | null = null;
+
+  // The progress the trigger shows. It trails a refreshed /users/@me while
+  // the bar catches up to it (see navCatchUp).
+  @state() private shownProgress: Progress | null = null;
+  // Whether the progress the trigger heads for is provisional: it counts the
+  // XP of games still waiting to be scored (ProvisionalProgress.ts).
+  @state() private provisional = false;
+  // Bumped when the pending XP changes, so the progress is read again.
+  @state() private provisionalRev = 0;
+  // While catching up: the fill's width in place of the progress's (100 to
+  // finish the old level, 0 to start the new one), and its transition.
+  @state() private barOverride: number | null = null;
+  @state() private barMs = 0;
+  @state() private levelPop = false;
+  private catchUpToken = 0;
+  private catchUpTimers: ReturnType<typeof setTimeout>[] = [];
+  // What the running step waits for: the fill's transition to end.
+  private onBarSettled: (() => void) | null = null;
+
+  // The panel is rendered into document.body, not into the nav: the nav bar
+  // owns a stacking context, so anything inside it can be painted under the
+  // page's overlays (modals) or paint over ones that should win (toasts).
+  private panel: HTMLDivElement | null = null;
+
+  createRenderRoot() {
+    return this;
+  }
+
+  connectedCallback() {
+    super.connectedCallback();
+    document.addEventListener(
+      "userMeResponse",
+      this.handleUserMeResponse as EventListener,
+    );
+    document.addEventListener(
+      PROVISIONAL_PROGRESS_CHANGED,
+      this.handleProvisionalChanged,
+    );
+    document.addEventListener("click", this.handleDocumentClick);
+    window.addEventListener("keydown", this.handleKeyDown);
+    window.addEventListener("showPage", this.closeMenu);
+    // The panel is positioned from the trigger's box, so a resize would leave
+    // it stranded — close instead of tracking.
+    window.addEventListener("resize", this.closeMenu);
+
+    // Auth resolves once, early. A menu created after that (a re-rendered play
+    // page, a reconnected element) would otherwise sit on its initial
+    // signed-out state forever, so seed from the cached response instead.
+    this.refreshPortalUser();
+
+    const cached = latestUserMeResponse();
+    if (cached !== null) {
+      this.userMeResponse = cached;
+      // The trigger's avatar/badge state is imperative, so re-apply it to this
+      // instance's freshly-rendered markup too.
+      void this.updateComplete.then(() => updateAccountNavButton(cached));
+    }
+  }
+
+  disconnectedCallback() {
+    document.removeEventListener(
+      "userMeResponse",
+      this.handleUserMeResponse as EventListener,
+    );
+    document.removeEventListener(
+      PROVISIONAL_PROGRESS_CHANGED,
+      this.handleProvisionalChanged,
+    );
+    document.removeEventListener("click", this.handleDocumentClick);
+    window.removeEventListener("keydown", this.handleKeyDown);
+    window.removeEventListener("showPage", this.closeMenu);
+    window.removeEventListener("resize", this.closeMenu);
+    this.removePanel();
+    this.stopCatchUp();
+    super.disconnectedCallback();
+  }
+
+  protected willUpdate(changed: PropertyValues): void {
+    if (
+      !changed.has("userMeResponse") &&
+      !changed.has("portalUser") &&
+      !changed.has("provisionalRev")
+    ) {
+      return;
+    }
+    const view = this.progressView();
+    this.provisional = view?.provisional ?? false;
+    const next = view?.progress ?? null;
+    const shown = this.shownProgress;
+    if (next === shown) return;
+    // A catch-up still running is overtaken: carry on from what it shows.
+    this.stopCatchUp();
+    const mode = navCatchUp(shown, next, {
+      onScreen: this.isOnScreen(),
+      pageVisible: document.visibilityState === "visible",
+      reducedMotion: prefersReducedMotion(),
+    });
+    if (mode === "snap" || next === null) {
+      this.shownProgress = next;
+      return;
+    }
+    void this.catchUp(mode, next);
+  }
+
+  /** Whether this instance is laid out (the other trigger is hidden). */
+  protected isOnScreen(): boolean {
+    if (typeof this.checkVisibility === "function") {
+      return this.checkVisibility();
+    }
+    return this.getClientRects().length > 0;
+  }
+
+  // The bar catching up to new progress, as the player watches: within a
+  // level it grows to the new width; across one it fills to the end, the
+  // level ticks over with a pop, it empties without a transition and grows
+  // to the new width.
+  private async catchUp(mode: NavCatchUp, next: Progress): Promise<void> {
+    const token = ++this.catchUpToken;
+    if (mode === "level_up") {
+      this.barMs = NAV_CATCH_UP_MS;
+      this.barOverride = 100;
+      await this.barSettled(token);
+      if (token !== this.catchUpToken) return;
+      this.shownProgress = next;
+      this.levelPop = true;
+      this.later(NAV_LEVEL_POP_MS, () => (this.levelPop = false));
+      this.barMs = 0;
+      this.barOverride = 0;
+      await this.updateComplete;
+      if (token !== this.catchUpToken) return;
+      // Lay the empty bar out, so the grow below starts from it.
+      this.querySelector(
+        "[data-account-xp-bar] [data-xp-bar-fill]",
+      )?.getBoundingClientRect();
+    }
+    this.barMs = NAV_CATCH_UP_MS;
+    this.barOverride = null;
+    this.shownProgress = next;
+    await this.barSettled(token);
+    if (token !== this.catchUpToken) return;
+    this.barMs = 0;
+  }
+
+  // Resolves when the fill's transition ends; or a little after it should
+  // have, if it never reports (an unchanged width, a hidden bar).
+  private barSettled(token: number): Promise<void> {
+    return new Promise((resolve) => {
+      let done = false;
+      const settle = () => {
+        if (done) return;
+        done = true;
+        if (this.onBarSettled === settle) this.onBarSettled = null;
+        resolve();
+      };
+      this.onBarSettled = settle;
+      this.later(NAV_CATCH_UP_MS + 150, () => {
+        if (token === this.catchUpToken) settle();
+      });
+    });
+  }
+
+  private handleBarTransitionEnd = (e: TransitionEvent) => {
+    if (e.propertyName !== "width") return;
+    this.onBarSettled?.();
+  };
+
+  private later(ms: number, fn: () => void): void {
+    this.catchUpTimers.push(setTimeout(fn, ms));
+  }
+
+  private stopCatchUp(): void {
+    this.catchUpToken++;
+    for (const t of this.catchUpTimers) clearTimeout(t);
+    this.catchUpTimers = [];
+    this.onBarSettled = null;
+    this.barOverride = null;
+    this.barMs = 0;
+    this.levelPop = false;
+  }
+
+  protected updated(): void {
+    if (!this.menuOpen) {
+      this.removePanel();
+      return;
+    }
+    const trigger = this.querySelector<HTMLElement>("[data-account-trigger]");
+    if (!trigger) return;
+
+    if (this.panel === null) {
+      this.panel = document.createElement("div");
+      this.panel.style.position = "fixed";
+      this.panel.style.zIndex = "41000";
+      document.body.appendChild(this.panel);
+    }
+    const rect = trigger.getBoundingClientRect();
+    this.panel.style.top = `${rect.bottom + 8}px`;
+    this.panel.style.right = `${Math.max(8, window.innerWidth - rect.right)}px`;
+    render(this.renderMenu(), this.panel);
+  }
+
+  private removePanel(): void {
+    if (this.panel === null) return;
+    render(nothing, this.panel);
+    this.panel.remove();
+    this.panel = null;
+  }
+
+  private handleProvisionalChanged = () => {
+    this.provisionalRev++;
+  };
+
+  private handleUserMeResponse = (
+    event: CustomEvent<UserMeResponse | false>,
+  ) => {
+    this.userMeResponse = event.detail;
+    // A portal sign-in surfaces as a userMeResponse, so re-read the SDK
+    // profile alongside it.
+    this.refreshPortalUser();
+  };
+
+  private refreshPortalUser(): void {
+    if (!gamePortal.isOnGamePortal()) return;
+    void gamePortal.getUserProfile().then((user) => {
+      this.portalUser = user;
+    });
+  }
+
+  /**
+   * Signed in for menu purposes. An anonymous session still resolves to a
+   * UserMeResponse, so a linked identity is what counts — plus, on a portal,
+   * an SDK profile whose token exchange produced a session.
+   */
+  private isSignedIn(): boolean {
+    if (this.userMeResponse === false) return false;
+    return (
+      hasLinkedIdentity(this.userMeResponse.user) || this.portalUser !== null
+    );
+  }
+
+  private closeMenu = () => {
+    this.menuOpen = false;
+  };
+
+  private handleDocumentClick = (e: MouseEvent) => {
+    if (!this.menuOpen) return;
+    const path = e.composedPath();
+    if (path.includes(this)) return;
+    if (this.panel !== null && path.includes(this.panel)) return;
+    this.menuOpen = false;
+  };
+
+  private handleKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "Escape" && this.menuOpen) {
+      this.menuOpen = false;
+    }
+  };
+
+  private handleTriggerClick = (e: MouseEvent) => {
+    // The menu is the account affordance in every state, so the delegated nav
+    // router never gets this click — the "View account" / "Sign in" items open
+    // the modal instead.
+    e.preventDefault();
+    e.stopPropagation();
+    this.menuOpen = !this.menuOpen;
+  };
+
+  private items(): MenuItem[] {
+    // Signed out there is only the sign-in route for this platform: settings
+    // are reached from the navbar, in every signed-in state and out of it.
+    if (!this.isSignedIn()) {
+      return [
+        {
+          key: "sign-in",
+          labelKey: "main.sign_in",
+          icon: iconUser,
+          onSelect: () => this.signIn(),
+        },
+      ];
+    }
+
+    const player =
+      this.userMeResponse === false ? null : this.userMeResponse.player;
+    // A past_due subscriber still needs the panel: it is where they reach
+    // the billing portal to fix the failed payment.
+    const subscribed =
+      (player?.subscription !== undefined && player?.subscription !== null) ||
+      (player?.pastDueSubscription !== undefined &&
+        player?.pastDueSubscription !== null);
+    const publicId = player?.publicId ?? "";
+
+    const items: MenuItem[] = [];
+
+    // Nothing to share without a publicId (older backend, or a session whose
+    // player record hasn't resolved). Not on Poki: the link leads players off
+    // Poki.
+    if (publicId && gamePortal.name() !== "poki") {
+      items.push({
+        key: "copy-profile-url",
+        labelKey: "nav_account_menu.copy_profile_url",
+        icon: iconShare,
+        onSelect: () => void this.copyProfileUrl(publicId),
+      });
+    }
+
+    items.push(
+      {
+        key: "view-account",
+        labelKey: "nav_account_menu.view_account",
+        icon: iconUser,
+        onSelect: () => {
+          window.showPage?.("page-account");
+        },
+      },
+      {
+        key: "account-settings",
+        labelKey: "nav_account_menu.account_settings",
+        icon: iconGear,
+        onSelect: () => this.openModal("account-settings"),
+      },
+      {
+        key: "change-username",
+        labelKey: "nav_account_menu.change_username",
+        icon: iconTag,
+        onSelect: () => this.openModal("change-username"),
+      },
+    );
+
+    if (subscribed) {
+      items.push({
+        key: "subscription",
+        labelKey: "nav_account_menu.change_subscription",
+        icon: iconCard,
+        onSelect: () => this.openModal("subscription"),
+      });
+    }
+
+    // Portals own their own sessions: signing out happens on their site, and
+    // our /auth/logout wouldn't end theirs. On Steam the session comes from the
+    // Steam ticket, which signs the player straight back in after the reload.
+    if (!gamePortal.isOnGamePortal() && !steamSDK.isOnSteam()) {
+      items.push({
+        key: "log-out",
+        labelKey: "nav_account_menu.log_out",
+        icon: iconLogOut,
+        onSelect: () => void this.handleLogOut(),
+        danger: true,
+      });
+    }
+
+    return items;
+  }
+
+  // Portal players sign in through the SDK prompt; everyone else through
+  // the account modal's login options.
+  private signIn(): void {
+    if (gamePortal.isOnGamePortal()) {
+      void gamePortal.showAuthPrompt();
+      return;
+    }
+    window.showPage?.("page-account");
+  }
+
+  // Same copy + toast the account modal's share button gives.
+  private async copyProfileUrl(publicId: string): Promise<void> {
+    try {
+      await copyToClipboard(playerProfileUrl(publicId));
+      showToast(translateText("common.copied"), "green");
+    } catch {
+      showToast(translateText("common.failed_copy"), "red");
+    }
+  }
+
+  // The profile-menu modals are popup (non-inline) modals registered with the
+  // router, so the hash is what opens them.
+  private openModal(name: string): void {
+    window.location.hash = `modal=${name}`;
+  }
+
+  private async handleLogOut(): Promise<void> {
+    const confirmed = await showInGameConfirm(
+      translateText("nav_account_menu.log_out_confirm"),
+      {
+        heading: translateText("nav_account_menu.log_out"),
+        confirmText: translateText("nav_account_menu.log_out"),
+      },
+    );
+    if (!confirmed) return;
+    await logOut();
+    // Reload so every consumer of the session starts from a signed-out state.
+    window.location.reload();
+  }
+
+  private selectItem(item: MenuItem): void {
+    this.menuOpen = false;
+    closeMobileSidebar();
+    item.onSelect();
+  }
+
+  render(): TemplateResult {
+    return html`
+      <div class="relative" data-account-nav>
+        ${
+          this.variant === "mobile"
+            ? this.renderMobileTrigger()
+            : this.renderDesktopTrigger()
+        }
+      </div>
+    `;
+  }
+
+  private renderMenu(): TemplateResult {
+    return html`
+      <!-- No vertical padding on the panel: items run edge to edge so a hovered
+           row (the red Log out especially) fills the corner instead of leaving
+           a dead strip under it. overflow-hidden clips them to the radius.
+
+           Width grows to the longest label (translations run longer than the
+           English) up to a cap, past which labels wrap instead of pushing the
+           panel off-screen — the cap also tracks the viewport for narrow
+           phones. -->
+      <div
+        role="menu"
+        aria-label=${translateText("nav_account_menu.title")}
+        class="w-max min-w-60 max-w-[min(20rem,calc(100vw-1rem))] rounded-xl border border-white/10 bg-zinc-900 shadow-xl overflow-hidden"
+      >
+        ${this.renderProvisionalNote()}
+        ${this.items().map(
+          (item) => html`
+            <button
+              role="menuitem"
+              data-menu-item=${item.key}
+              @click=${() => this.selectItem(item)}
+              class="w-full flex items-center gap-3 px-4 py-3 text-left text-sm font-medium normal-case tracking-normal cursor-pointer transition-colors ${
+                item.danger
+                  ? "text-red-400 hover:bg-red-500/10 border-t border-white/10"
+                  : "text-white/80 hover:bg-white/10 hover:text-white"
+              }"
+            >
+              <span class="w-4 h-4 shrink-0">${item.icon}</span>
+              <span class="min-w-0 break-words"
+                >${translateText(item.labelKey)}</span
+              >
+            </button>
+          `,
+        )}
+      </div>
+    `;
+  }
+
+  // Heads the menu while the trigger's level counts XP still waiting to be
+  // scored: the level and XP it shows, and that they're provisional.
+  private renderProvisionalNote(): TemplateResult | typeof nothing {
+    const view = this.progressView();
+    if (view === null || !view.provisional) return nothing;
+    const { progress } = view;
+    return html`<div
+      data-menu-provisional
+      class="flex items-center gap-3 px-4 py-3 border-b border-white/10 bg-white/[0.03]"
+    >
+      <level-badge
+        .level=${progress.level}
+        .prestige=${progress.prestige}
+        .legend=${progress.legend}
+        .size=${28}
+      ></level-badge>
+      <div class="min-w-0 text-xs leading-snug">
+        <div class="font-bold text-white normal-case tracking-normal">
+          ${levelBadgeLabel(progress.level, progress.prestige, progress.legend)}
+          <span class="text-white/40">·</span>
+          <span class="tabular-nums text-white/70"
+            >${xpProgressText(progress.xpInLevel, progress.xpForNext)}</span
+          >
+        </div>
+        <div
+          class="mt-0.5 text-amber-200/80 normal-case tracking-normal break-words"
+        >
+          ${translateText("progression.provisional_label")}
+        </div>
+      </div>
+    </div>`;
+  }
+
+  private renderChevron(): TemplateResult {
+    return html`
+      <svg
+        class="w-3 h-3 shrink-0 transition-transform ${
+          this.menuOpen ? "rotate-180" : ""
+        }"
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        aria-hidden="true"
+      >
+        <path d="m6 9 6 6 6-6" />
+      </svg>
+    `;
+  }
+
+  private progressView(): { progress: Progress; provisional: boolean } | null {
+    if (!this.isSignedIn() || this.userMeResponse === false) return null;
+    const { publicId, progress } = this.userMeResponse.player;
+    if (progress === undefined) return null;
+    return provisionalProgress(publicId, progress);
+  }
+
+  // The trigger's accessible name. Its aria-label would otherwise hide the
+  // level badge inside it from screen readers, so the level is in it too.
+  private triggerLabel(): string {
+    const view = this.progressView();
+    if (view === null) return translateText("main.account");
+    const { progress } = view;
+    const label = translateText("nav_account_menu.account_with_level", {
+      level: levelBadgeLabel(
+        progress.level,
+        progress.prestige,
+        progress.legend,
+      ),
+    });
+    return view.provisional
+      ? `${label} · ${translateText("progression.provisional_label")}`
+      : label;
+  }
+
+  // Level badge beside the avatar, plus a thin XP bar along the trigger's
+  // bottom edge. Absent entirely when /users/@me carries no progress.
+  private renderLevel(
+    variant: "desktop" | "mobile",
+  ): TemplateResult | typeof nothing {
+    const progress = this.shownProgress;
+    if (progress === null) return nothing;
+    const label = levelBadgeLabel(
+      progress.level,
+      progress.prestige,
+      progress.legend,
+    );
+    const title = [
+      label,
+      xpProgressText(progress.xpInLevel, progress.xpForNext),
+      ...(this.provisional
+        ? [translateText("progression.provisional_label")]
+        : []),
+    ].join(" · ");
+    // Phones: 20px (smaller, the unit icon can't be read) on the avatar's
+    // corner, anchored 6px out so it grows away from the avatar, not over it.
+    const mobile = variant === "mobile";
+    return html`
+      ${
+        this.levelPop
+          ? html`<style>
+              @keyframes nav-level-pop {
+                0% {
+                  transform: scale(1);
+                }
+                35% {
+                  transform: scale(1.55);
+                  filter: drop-shadow(0 0 6px rgba(250, 204, 21, 0.9));
+                }
+                100% {
+                  transform: scale(1);
+                }
+              }
+              .nav-level-pop level-badge {
+                display: block;
+                animation: nav-level-pop ${NAV_LEVEL_POP_MS}ms
+                  cubic-bezier(0.2, 0.9, 0.3, 1.3);
+              }
+              @media (prefers-reduced-motion: reduce) {
+                .nav-level-pop level-badge {
+                  animation: none;
+                }
+              }
+            </style>`
+          : nothing
+      }
+      <span
+        data-account-level
+        ?data-provisional=${this.provisional}
+        class="${
+          mobile ? "absolute -top-1.5 -left-1.5 z-10" : "flex items-center"
+        } ${this.levelPop ? "nav-level-pop" : ""}"
+        title=${title}
+      >
+        <level-badge
+          .level=${progress.level}
+          .prestige=${progress.prestige}
+          .legend=${progress.legend}
+          .size=${mobile ? 20 : 22}
+        ></level-badge>
+      </span>
+    `;
+  }
+
+  // The thin XP bar under the trigger's level badge and avatar. Desktop: in
+  // the row's bottom padding, so the avatar never overhangs it. Mobile: just
+  // under the avatar.
+  private renderXpBar(
+    variant: "desktop" | "mobile",
+  ): TemplateResult | typeof nothing {
+    const progress = this.shownProgress;
+    if (progress === null) return nothing;
+    const percent =
+      this.barOverride ??
+      levelFraction(progress.xpInLevel, progress.xpForNext) * 100;
+    return html`
+      <span
+        data-account-xp-bar
+        class="pointer-events-none absolute ${
+          variant === "mobile"
+            ? "-bottom-1.5 left-0 right-0"
+            : "bottom-0 left-0 right-0"
+        }"
+        aria-hidden="true"
+      >
+        ${xpBar(percent, {
+          heightClass: "h-[3px]",
+          transitionMs: this.barMs,
+          fillClass:
+            this.barMs > 0 ? "shadow-[0_0_6px_rgba(56,189,248,0.9)]" : "",
+          onFillTransitionEnd: this.handleBarTransitionEnd,
+        })}
+      </span>
+    `;
+  }
+
+  // Avatar / spinner / person icon / email badge, shared by both triggers.
+  // `ids` is populated for the desktop instance only — NavAccountButton and
+  // PortalAccountButton drive that one by id — while the data-account-*
+  // hooks are what both instances are updated through.
+  private renderIdentityIcons(opts: {
+    ids: boolean;
+    iconClass: string;
+    badgeClass: string;
+  }): TemplateResult {
+    const id = (name: string) => (opts.ids ? name : undefined);
+    return html`
+      <img
+        id=${ifDefined(id("nav-account-avatar"))}
+        data-account-avatar
+        class="hidden w-8 h-8 rounded-full object-cover"
+        alt=""
+        data-i18n-alt="main.discord_avatar_alt"
+        referrerpolicy="no-referrer"
+      />
+      <span
+        id=${ifDefined(id("nav-account-loading-spinner"))}
+        data-account-spinner
+        class="w-4 h-4 border-2 border-white/30 border-t-white/80 rounded-full animate-spin"
+        aria-hidden="true"
+      ></span>
+      <svg
+        id=${ifDefined(id("nav-account-person-icon"))}
+        data-account-person-icon
+        class="hidden ${opts.iconClass}"
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M20 21a8 8 0 0 0-16 0" />
+        <path d="M12 13a4 4 0 1 0-4-4 4 4 0 0 0 4 4Z" />
+      </svg>
+      <span
+        id=${ifDefined(id("nav-account-email-badge"))}
+        data-account-email-badge
+        class="hidden ${opts.badgeClass} w-4 h-4 rounded-full bg-slate-900/80 border border-white/20 flex items-center justify-center"
+        aria-hidden="true"
+      >
+        <svg
+          class="w-2.5 h-2.5 text-white/80"
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M4 6h16v12H4z" />
+          <path d="m4 7 8 6 8-6" />
+        </svg>
+      </span>
+    `;
+  }
+
+  // Desktop nav pill. Ids are load-bearing: NavAccountButton and
+  // PortalAccountButton drive this instance by id.
+  private renderDesktopTrigger(): TemplateResult {
+    return html`
+      <button
+        id="nav-account-button"
+        data-account-trigger
+        data-account-border
+        aria-haspopup="menu"
+        aria-expanded=${this.menuOpen ? "true" : "false"}
+        @click=${this.handleTriggerClick}
+        class="nav-menu-item relative h-10 rounded-full flex items-center justify-center gap-2 px-3 bg-transparent border border-white/20 text-white/80 hover:text-white cursor-pointer transition-colors [&.active]:text-white"
+        data-page="page-account"
+        aria-label=${this.triggerLabel()}
+        data-i18n-title="main.account"
+      >
+        <!-- The badge and the avatar, with the XP bar under both in the row's
+             bottom padding: the avatar is a size smaller while there is a
+             bar, so it clears it. The row is always here (only its classes
+             change): the avatar and icons inside are driven imperatively by
+             NavAccountButton and must not be re-created. -->
+        <span
+          data-account-identity
+          class="relative flex items-center gap-2 ${
+            this.shownProgress !== null
+              ? "pb-1.5 [&_[data-account-avatar]]:h-7 [&_[data-account-avatar]]:w-7"
+              : ""
+          }"
+        >
+          ${this.renderLevel("desktop")}
+          ${this.renderIdentityIcons({
+            ids: true,
+            iconClass: "w-5 h-5",
+            badgeClass: "absolute -top-1 -right-1.5",
+          })}
+          ${this.renderXpBar("desktop")}
+        </span>
+        <span
+          id="nav-account-signin-text"
+          data-account-signin-text
+          class="hidden text-xs font-bold tracking-widest"
+          data-i18n="main.sign_in"
+        >
+        </span>
+        ${this.renderChevron()}
+      </button>
+    `;
+  }
+
+  // Mobile top-bar trigger: avatar or person icon only, plus the chevron.
+  private renderMobileTrigger(): TemplateResult {
+    return html`
+      <button
+        data-account-trigger
+        aria-haspopup="menu"
+        aria-expanded=${this.menuOpen ? "true" : "false"}
+        @click=${this.handleTriggerClick}
+        class="nav-menu-item h-10 flex items-center justify-center gap-1 pl-1 pr-1.5 rounded-full text-white/90 cursor-pointer transition-colors"
+        data-page="page-account"
+        aria-label=${this.triggerLabel()}
+        data-i18n-title="main.account"
+      >
+        <span class="relative flex items-center justify-center w-8 h-8">
+          ${this.renderIdentityIcons({
+            ids: false,
+            iconClass: "w-7 h-7",
+            badgeClass: "absolute -bottom-0.5 -right-0.5",
+          })}
+          ${this.renderLevel("mobile")} ${this.renderXpBar("mobile")}
+        </span>
+        <!-- The sign-in label is desktop-only; on the top bar the icon alone is
+             the affordance, so keep the element (the shared updater toggles it)
+             but never show text. -->
+        <span data-account-signin-text class="hidden"></span>
+        ${this.renderChevron()}
+      </button>
+    `;
+  }
+}
+
+const iconShare = html`<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.8"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  class="w-full h-full"
+  aria-hidden="true"
+>
+  <circle cx="18" cy="5" r="3" />
+  <circle cx="6" cy="12" r="3" />
+  <circle cx="18" cy="19" r="3" />
+  <line x1="8.6" y1="10.5" x2="15.4" y2="6.5" />
+  <line x1="8.6" y1="13.5" x2="15.4" y2="17.5" />
+</svg>`;
+
+const iconUser = html`<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.8"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  class="w-full h-full"
+  aria-hidden="true"
+>
+  <path d="M20 21a8 8 0 0 0-16 0" />
+  <path d="M12 13a4 4 0 1 0-4-4 4 4 0 0 0 4 4Z" />
+</svg>`;
+
+const iconGear = html`<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.8"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  class="w-full h-full"
+  aria-hidden="true"
+>
+  <circle cx="12" cy="12" r="3" />
+  <path
+    d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"
+  />
+</svg>`;
+
+const iconTag = html`<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.8"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  class="w-full h-full"
+  aria-hidden="true"
+>
+  <path
+    d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82Z"
+  />
+  <line x1="7" y1="7" x2="7.01" y2="7" />
+</svg>`;
+
+const iconCard = html`<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.8"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  class="w-full h-full"
+  aria-hidden="true"
+>
+  <rect x="2" y="5" width="20" height="14" rx="2" />
+  <line x1="2" y1="10" x2="22" y2="10" />
+</svg>`;
+
+const iconLogOut = html`<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.8"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  class="w-full h-full"
+  aria-hidden="true"
+>
+  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+  <polyline points="16 17 21 12 16 7" />
+  <line x1="21" y1="12" x2="9" y2="12" />
+</svg>`;

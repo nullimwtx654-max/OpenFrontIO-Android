@@ -1,0 +1,43 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch full map resources if not committed in repo
+        run: |
+          if [ ! -d "resources/maps/surrounded" ]; then
+            echo "Fetching full map resources from openfrontio/OpenFrontIO..."
+            git clone --depth 1 --filter=blob:none --sparse https://github.com/openfrontio/OpenFrontIO.git /tmp/openfront-res
+            cd /tmp/openfront-res
+            git sparse-checkout set resources
+            cd "$GITHUB_WORKSPACE"
+            mkdir -p resources
+            cp -rn /tmp/openfront-res/resources/* resources/ || true
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cryptography for APK v1/v2 signing
+        run: pip install cryptography
+
+      - name: Generate CSS, index.html, and signed Android APK
+        run: |
+          python3 generate_css_and_html.py
+          python3 build_index_html.py
+          python3 build_apk.py
+
+      - name: Upload OpenFront_Android.apk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenFront_Android_APK
+          path: OpenFront_Android.apk
