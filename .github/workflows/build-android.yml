@@ -8,6 +8,8 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +37,35 @@ jobs:
           python3 generate_css_and_html.py
           python3 build_index_html.py
           python3 build_apk.py
+
+      - name: Get version from package.json
+        id: version
+        run: |
+          VERSION=$(cat package.json | grep '"version"' | head -1 | sed 's/.*"version": "\(.*\)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Release and upload APK
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: OpenFront Android v${{ steps.version.outputs.version }}
+          body: |
+            Unofficial Android port of [Open Front](https://openfront.io/).
+            
+            **Features:**
+            - ✅ Single-player mode (offline vs AI)
+            - ✅ Saving functionality (local game persistence)
+            - ✅ Touch-optimized controls
+            - ✅ Full game content
+            
+            Built from commit ${{ github.sha }}
+          draft: false
+          prerelease: false
+          files: |
+            OpenFront_Android.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload OpenFront_Android.apk artifact
         uses: actions/upload-artifact@v4
