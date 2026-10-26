@@ -1,3 +1,6 @@
+Dude some idiots genuinely do not know what open-source or forking a repository means. well have fun trying to sue me for doing a perfectly legal thing.
+
+
 # OpenFrontIO-Android
 
 An **unofficial port** of [Open Front](https://openfront.io/) to Android.
