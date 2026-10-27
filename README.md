@@ -1,3 +1,11 @@
+What this isn't:
+1 this isn't a competitor or seperate app.
+
+What this is:
+1 An UNOFFICIAL and MODIFIED NON COMMERCIAL, FAN PROJECT port of openfront io. I do not claim ANY CREDIT for ANYTHING. This is simply a well intentioned port of the game for anyone who doesn't have a phone powerful enough to run this without crashes. Or desires a save system with it.
+
+
+
 # OpenFrontIO-Android
 
 An **unofficial port** of [Open Front](https://openfront.io/) to Android.
